@@ -109,33 +109,36 @@ def process_shard(args, vocab_size):
         text2 = text2.strip()
         tokens2 = enc.encode(text2, bos=True, eos=False)
         if example["label"] == 1:
-            all_tokens.extend([tokens1, tokens2])
+            all_tokens.append({"story1": tokens1, "story2": tokens2})
         else:
-            all_tokens.extend([tokens2, tokens1])
+            all_tokens.append({"story1": tokens2, "story2": tokens1})
     # convert to uint16 nparray
-    all_tokens = np.array(all_tokens, dtype=np.uint16)
     # calculate the output filename
     if vocab_size == 0:
         # if we're using Llama 2, just save the tokenized file in the same dir
-        tokenized_filename = shard.replace(".json", ".bin")
+        bin_basename = shard.split("/")
+        bin_basename[-1] = "tokenized_" + bin_basename[-1]
+        tokenized_filename = os.path.join(*bin_basename)
     else:
         # save .bin files into a new tok{N} directory
         bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
         shard_basename = os.path.basename(shard)
-        bin_basename = shard_basename.replace(".json", ".bin")
+        bin_basename = shard_basename.split("/")
+        bin_basename[-1] = "tokenized_" + bin_basename[-1]
+        bin_basename = os.path.join(*bin_basename)
         tokenized_filename = os.path.join(bin_dir, bin_basename)
     # write the bytes
-    with open(tokenized_filename, "wb") as f:
-        f.write(all_tokens.tobytes())
+    with open(tokenized_filename, "w") as f:
+        json.dump(all_tokens, f)
     # calculate the average sequence length (they are separated by BOS=1)
-    avg_seq_len = all_tokens.size / ((all_tokens == 1).sum())
-    print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
+    print(f"Saved {tokenized_filename}")
 
 
 def pretokenize(vocab_size):
     # iterate the shards and tokenize all of them one by one
     data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "preferencedata_test*.json")))
+    print(shard_filenames)
     if vocab_size > 0:
         # .bin files will be saved into tok{N} directory, create it once here
         bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
@@ -143,8 +146,10 @@ def pretokenize(vocab_size):
 
     # process all the shards in a process pool
     fun = partial(process_shard, vocab_size=vocab_size)
-    with ProcessPoolExecutor() as executor:
-        executor.map(fun, enumerate(shard_filenames))
+    for shared in enumerate(shard_filenames):
+        fun(shared)
+    # with ProcessPoolExecutor() as executor:
+        # executor.map(fun, enumerate(shard_filenames))
     print("Done.")
 
 
@@ -171,19 +176,20 @@ class PretokDataset(torch.utils.data.IterableDataset):
         if self.vocab_source == "llama2":
             # the .bin files are right along the .json files
             bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "tokenized_preferencedata_test*.json")))
         elif self.vocab_source == "custom":
             # the .bin files are in tok{N} directory
             bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "tokenized_preferencedata_test*.json")))
         # train/test split. let's use only shard 0 for test split, rest train
         shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
         assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
         while True:
             rng.shuffle(shard_filenames)
             for shard in shard_filenames:
+                with open(shard, "r") as f:
                 # open the dataset for reading but keep it on disk with memmap
-                m = np.memmap(shard, dtype=np.uint16, mode="r")
+                    m = json.load(f)
                 num_batches = len(m) // self.max_seq_len
                 num_batches -= 1  # drop the last partial batch
                 assert num_batches > 0, "this shard is way too small? investigate."
