@@ -28,7 +28,7 @@ from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from tinystories import Task
+from preference import Task
 from export import model_export
 
 # -----------------------------------------------------------------------------
@@ -216,9 +216,11 @@ def estimate_loss():
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
-            X, Y = next(batch_iter)
+            story1, story2 = next(batch_iter)
+            print(story1)
+            print(story2)
             with ctx:
-                logits = model(X, Y)
+                logits = model(story1, story2)
                 loss = raw_model.last_loss
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -246,7 +248,7 @@ if wandb_log and master_process:
 
 # training loop
 train_batch_iter = iter_batches(split="train")
-X, Y = next(train_batch_iter)  # fetch the very first batch
+story1, story2 = next(train_batch_iter)  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -302,11 +304,11 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            logits = model(X, Y)
+            logits = model(story1, story2)
             loss = raw_model.last_loss
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = next(train_batch_iter)
+        story1, story2 = next(train_batch_iter)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

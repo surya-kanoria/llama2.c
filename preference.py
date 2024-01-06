@@ -186,23 +186,18 @@ class PretokDataset(torch.utils.data.IterableDataset):
         assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
         while True:
             rng.shuffle(shard_filenames)
+            story1 = []
+            story2 = []
             for shard in shard_filenames:
                 with open(shard, "r") as f:
                 # open the dataset for reading but keep it on disk with memmap
-                    m = json.load(f)
-                num_batches = len(m) // self.max_seq_len
-                num_batches -= 1  # drop the last partial batch
-                assert num_batches > 0, "this shard is way too small? investigate."
-                ixs = list(range(num_batches))
-                rng.shuffle(ixs)
-                for ix in ixs:
-                    start = ix * self.max_seq_len
-                    end = start + self.max_seq_len + 1
-                    # calling .astype will copy the data into a new numpy array, now in RAM
-                    chunk = torch.from_numpy((m[start:end]).astype(np.int64))
-                    x = chunk[:-1]
-                    y = chunk[1:]
-                    yield x, y
+                    stories = json.load(f)
+                    for story in stories:
+                        story1.append(story["story1"])
+                        story2.append(story["story2"])
+                    story1 = torch.from_numpy(np.asanyarray(story1).astype(np.int64))
+                    story2 = torch.from_numpy(np.asarray(story2).astype(np.int64))
+                    yield story1, story2
 
 # -----------------------------------------------------------------------------
 # public interface functions
