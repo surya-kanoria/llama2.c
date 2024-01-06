@@ -24,9 +24,10 @@ from datetime import datetime
 from functools import partial
 
 import torch
-from model import Transformer, ModelArgs
+from model import Transformer, ModelArgs, RewardModel
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn.functional as F
 
 from preference import Task
 from export import model_export
@@ -70,7 +71,9 @@ warmup_iters = 1000  # how many steps to warm up for
 # system
 device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "float16"  # float32|bfloat16|float16
-compile = True  # use PyTorch 2.0 to compile the model to be faster
+compile = False  # use PyTorch 2.0 to compile the model to be faster
+# loss hparams
+beta = 0.1
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -158,7 +161,11 @@ if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
+    model_ref = Transformer(gptconf)
+    model_ref = RewardModel(model_ref, gptconf)
+    model_ref.eval()
     model = Transformer(gptconf)
+    model = RewardModel(model, gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -182,6 +189,7 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+model_ref.to(device)
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -198,6 +206,7 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
+    model_ref = torch.compile(model_ref)
 
 # wrap model into DDP container
 if ddp:
@@ -206,6 +215,8 @@ if ddp:
     prefix = "_orig_mod." if compile else ""
     model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
     model = DDP(model, device_ids=[ddp_local_rank])
+    model_ref._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+    model_ref = DDP(model_ref, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -217,15 +228,23 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
             story1, story2 = next(batch_iter)
-            print(story1)
-            print(story2)
             with ctx:
-                logits = model(story1, story2)
-                loss = raw_model.last_loss
+                pie_theta_w = model(story1)
+                pie_theta_l = model(story2)
+                pie_ref_w = model_ref(story1)
+                pie_ref_l = model_ref(story2)
+                loss = get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
+
+def get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l):
+    pie_log_ratios = torch.log(pie_theta_w) - torch.log(pie_theta_l)
+    ref_log_ratios = torch.log(pie_ref_w) - torch.log(pie_ref_l)
+    losses = -F.logsigmoid(beta * (pie_log_ratios - ref_log_ratios))
+    return losses.mean()
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -291,6 +310,7 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
                 model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
+    print(iter_num, max_iters)
     if iter_num == 0 and eval_only:
         break
 
@@ -304,8 +324,11 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            logits = model(story1, story2)
-            loss = raw_model.last_loss
+            pie_theta_w = model(story1)
+            pie_theta_l = model(story2)
+            pie_ref_w = model_ref(story1)
+            pie_ref_l = model_ref(story2)
+            loss = get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l)
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         story1, story2 = next(train_batch_iter)
@@ -338,6 +361,7 @@ while True:
     local_iter_num += 1
 
     # termination conditions
+    print(iter_num, max_iters)
     if iter_num > max_iters:
         break
 

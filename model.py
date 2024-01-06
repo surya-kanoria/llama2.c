@@ -341,3 +341,46 @@ class Transformer(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+class RewardModel(nn.Module):
+
+    def __init__(self, transformer: Transformer, params: ModelArgs):
+        super().__init__()
+        self._transformer: Transformer = transformer
+        self.reward_layer = nn.Linear(params.dim, 1, bias=False)
+     
+
+    @torch.inference_mode()
+    def generate(self, *args, **kwargs):
+        return self._transformer.generate(*args, **kwargs)
+    
+    def estimate_mfu(self, *args, **kwargs):
+        return self._transformer(*args, **kwargs)
+    
+    def configure_optimizers(self, *args, **kwargs):
+        # start with all of the candidate parameters
+        return self._transformer.configure_optimizers(*args, **kwargs)
+
+    def estimate_mfu(self, *args, **kwargs):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        return self._transformer.estimate_mfu(*args, **kwargs)
+    
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        print("Here", tokens.shape)
+        _bsz, seqlen = tokens.shape
+        h = self._transformer.tok_embeddings(tokens)
+        h = self._transformer.dropout(h)
+        freqs_cos = self._transformer.freqs_cos[:seqlen]
+        freqs_sin = self._transformer.freqs_sin[:seqlen]
+
+        for layer in self._transformer.layers:
+            h = layer(h, freqs_cos, freqs_sin)
+        h = self._transformer.norm(h)
+
+        # if we are given some desired targets also calculate the loss
+        logits = self.reward_layer(h)[:,-1]
+
+        return logits
+

@@ -186,18 +186,14 @@ class PretokDataset(torch.utils.data.IterableDataset):
         assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
         while True:
             rng.shuffle(shard_filenames)
-            story1 = []
-            story2 = []
             for shard in shard_filenames:
                 with open(shard, "r") as f:
                 # open the dataset for reading but keep it on disk with memmap
                     stories = json.load(f)
                     for story in stories:
-                        story1.append(story["story1"])
-                        story2.append(story["story2"])
-                    story1 = torch.from_numpy(np.asanyarray(story1).astype(np.int64))
-                    story2 = torch.from_numpy(np.asarray(story2).astype(np.int64))
-                    yield story1, story2
+                        story1 = torch.from_numpy(np.asanyarray(story["story1"]).astype(np.int64))
+                        story2 = torch.from_numpy(np.asarray(story["story2"]).astype(np.int64))
+                        yield story1, story2
 
 # -----------------------------------------------------------------------------
 # public interface functions
