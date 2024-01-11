@@ -31,6 +31,8 @@ import torch.nn.functional as F
 
 from preference import Task
 from export import model_export
+from tokenizer import Tokenizer
+from preference import get_tokenizer_model_path
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -40,7 +42,8 @@ log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume'
+init_from = "resume"  # 'scratch' or 'resume'
+pretrained_checkpoint = 'out15M/stories15M.pt'
 # wandb logging
 wandb_log = False  # disabled by default
 wandb_project = "llamac"
@@ -162,15 +165,13 @@ if init_from == "scratch":
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
     model_ref = Transformer(gptconf)
-    model_ref = RewardModel(model_ref, gptconf)
     model_ref.eval()
     model = Transformer(gptconf)
-    model = RewardModel(model, gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(pretrained_checkpoint, map_location=device)
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -189,6 +190,9 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+    model_ref = Transformer(gptconf)
+    model_ref.load_state_dict(state_dict)
+    model_ref.eval()
 model_ref.to(device)
 model.to(device)
 
@@ -218,6 +222,15 @@ if ddp:
     model_ref._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
     model_ref = DDP(model_ref, device_ids=[ddp_local_rank])
 
+# Starting prompt
+tokenizer_model = get_tokenizer_model_path(vocab_size=0)
+enc = Tokenizer(tokenizer_model=tokenizer_model)
+
+# encode the beginning of the prompt
+start_ids = enc.encode("", bos=True, eos=False)
+x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+x = x.repeat((batch_size, 1))
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -229,10 +242,14 @@ def estimate_loss():
         for k in range(eval_iters):
             story1, story2 = next(batch_iter)
             with ctx:
-                pie_theta_w = model(story1)
-                pie_theta_l = model(story2)
-                pie_ref_w = model_ref(story1)
-                pie_ref_l = model_ref(story2)
+                pie_theta_w = F.softmax(model(story1[:,:-1]), dim=-1)
+                pie_theta_l = F.softmax(model(story2[:,:-1]), dim=-1)
+                pie_ref_w = F.softmax(model_ref(story1), dim=-1)
+                pie_ref_l =F.softmax(model_ref(story2), dim=-1)
+                pie_theta_w = torch.gather(pie_theta_w, -1, torch.unsqueeze(story1[:,1:], 1))
+                pie_theta_l = torch.gather(pie_theta_l, -1, torch.unsqueeze(story2[:,1:], 1))
+                pie_ref_w = torch.gather(pie_ref_w, -1, torch.unsqueeze(story1[:,1:], 1))
+                pie_ref_l = torch.gather(pie_ref_l, -1, torch.unsqueeze(story2[:,1:], 1))
                 loss = get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -243,6 +260,7 @@ def get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l):
     pie_log_ratios = torch.log(pie_theta_w) - torch.log(pie_theta_l)
     ref_log_ratios = torch.log(pie_ref_w) - torch.log(pie_ref_l)
     losses = -F.logsigmoid(beta * (pie_log_ratios - ref_log_ratios))
+    print(losses)
     return losses.mean()
 
 
@@ -324,10 +342,14 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            pie_theta_w = model(story1)
-            pie_theta_l = model(story2)
-            pie_ref_w = model_ref(story1)
-            pie_ref_l = model_ref(story2)
+            pie_theta_w = F.softmax(model(story1[:,:-1]), dim=-1)
+            pie_theta_l = F.softmax(model(story2[:,:-1]), dim=-1)
+            pie_ref_w = F.softmax(model_ref(story1), dim=-1)
+            pie_ref_l =F.softmax(model_ref(story2), dim=-1)
+            pie_theta_w = torch.gather(pie_theta_w, -1, torch.unsqueeze(story1[:,1:], 1))
+            pie_theta_l = torch.gather(pie_theta_l, -1, torch.unsqueeze(story2[:,1:], 1))
+            pie_ref_w = torch.gather(pie_ref_w, -1, torch.unsqueeze(story1[:,1:], 1))
+            pie_ref_l = torch.gather(pie_ref_l, -1, torch.unsqueeze(story2[:,1:], 1))
             loss = get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l)
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU

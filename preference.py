@@ -136,8 +136,8 @@ def process_shard(args, vocab_size):
 
 def pretokenize(vocab_size):
     # iterate the shards and tokenize all of them one by one
-    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "preferencedata_test*.json")))
+    data_dir = os.path.join(DATA_CACHE_DIR, "PreferenceDataset")
+    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "dataset_*.json")))
     print(shard_filenames)
     if vocab_size > 0:
         # .bin files will be saved into tok{N} directory, create it once here
