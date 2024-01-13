@@ -240,6 +240,8 @@ class Task:
         for x, y, x_l, y_l in dl:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            x_l = x_l.to(device, non_blocking=True)
+            y_l = y_l.to(device, non_blocking=True)
             yield x, y, x_l, y_l
 
 # -----------------------------------------------------------------------------

@@ -22,13 +22,13 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
-
+import numpy as np
 import torch
 from model import Transformer, ModelArgs, RewardModel
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
-
+from torch.utils.tensorboard import SummaryWriter
 from preference import Task
 from export import model_export
 from tokenizer import Tokenizer
@@ -36,9 +36,9 @@ from preference import get_tokenizer_model_path
 
 # -----------------------------------------------------------------------------
 # I/O
-eval_interval = 2000
+eval_interval = 1
 log_interval = 1
-eval_iters = 100
+eval_iters = 10
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = "resume"  # 'scratch' or 'resume'
@@ -68,10 +68,10 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = True  # whether to decay the learning rate
+decay_lr = False  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "float16"  # float32|bfloat16|float16
 compile = False  # use PyTorch 2.0 to compile the model to be faster
 # loss hparams
@@ -79,7 +79,10 @@ beta = 0.1
 IPO_tau_parameter=0.1
 loss_type = "DPO"
 set_type="set_1"
-out_dir = f"out_{loss_type}_{str(beta).replace('.','_')}_{set_type}_{str(IPO_tau_parameter).replace('.','_')}"
+# entropy
+max_new_tokens = 256
+temperature = 1.0
+top_k = 300
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -89,7 +92,8 @@ config_keys = [
 exec(open("configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
-
+out_dir = f"out_{loss_type}_beta_{str(beta).replace('.','_')}_{set_type}_IPO_{str(IPO_tau_parameter).replace('.','_')}_lr_{str(learning_rate).replace('.','_')}"
+print("Out dir: ", out_dir)
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
 min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
@@ -125,6 +129,8 @@ if master_process:
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+summary_writer = SummaryWriter(log_dir=os.path.join(out_dir, "logs"))
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
@@ -174,7 +180,6 @@ if init_from == "scratch":
 elif init_from == "resume":
     print(f"Resuming training from {pretrained_checkpoint}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
     checkpoint = torch.load(pretrained_checkpoint, map_location=device)
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
@@ -192,8 +197,8 @@ elif init_from == "resume":
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    iter_num = checkpoint["iter_num"]
-    best_val_loss = checkpoint["best_val_loss"]
+    # iter_num = checkpoint["iter_num"]
+    # best_val_loss = checkpoint["best_val_loss"]
     model_ref = Transformer(gptconf)
     model_ref.load_state_dict(state_dict)
     model_ref.eval()
@@ -205,8 +210,8 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == "resume" and "optimizer" in checkpoint:
-    optimizer.load_state_dict(checkpoint["optimizer"])
+# if init_from == "resume" and "optimizer" in checkpoint:
+#     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
 # compile the model
@@ -238,7 +243,7 @@ x = x.repeat((batch_size, 1))
 # helps estimate an arbitrarily accurate loss over either split using many batches
 def get_log_prob_of_stories(tokens, targets, model, story_length):
     logits =  F.softmax(model(tokens), dim=-1)
-    log_prob_tokens = torch.gather(logits, -1, torch.unsqueeze(targets, 1))
+    log_prob_tokens = torch.log(torch.gather(logits, -1, torch.unsqueeze(targets, 1)))
     log_prob_tokens = log_prob_tokens * story_length[:,1:]
     log_prob_of_stories = torch.sum(log_prob_tokens, dim=-1)
     return log_prob_of_stories
@@ -268,11 +273,24 @@ def estimate_loss():
     model.train()
     return out
 
+@torch.no_grad()
+def estimate_entropy():
+    model.eval()
+    entropy = []
+    for _ in range(eval_iters):
+        x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+        story, logits = model.sample(x, max_new_tokens, temperature, top_k)
+        log_prob_tokens = F.cross_entropy(logits, story.squeeze(), reduction="none")
+        entropy.append(log_prob_tokens.sum().item())
+    model.train()
+    return -np.mean(entropy)
+        
+
 def get_dpo_loss(pi_logratios, ref_logratio):
-    return -F.logsigmoid(beta * (pi_logratios - ref_logratio)).mean()
+    return -F.logsigmoid(beta * (pi_logratios - ref_logratio)).sum()
 
 def get_ipo_loss(pi_logratios, ref_logratio):
-    return torch.square(pi_logratios - ref_logratio - 1/(2*IPO_tau_parameter))
+    return torch.square(pi_logratios - ref_logratio - 1/(2*IPO_tau_parameter)).sum()
 
 # def get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l):
 #     pie_log_ratios = torch.log(pie_theta_w) - torch.log(pie_theta_l)
@@ -317,7 +335,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        entropy = estimate_entropy()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, entropy: {entropy:.4f}")
         if wandb_log:
             try:
                 wandb.log(
@@ -332,6 +351,9 @@ while True:
                 )
             except Exception as e:
                 print(f"logging to wandb failed: {e}")
+        summary_writer.add_scalar("Loss/train",losses["train"], iter_num)
+        summary_writer.add_scalar("Loss/eval",losses["val"], iter_num)
+        summary_writer.add_scalar("Entropy", entropy, iter_num)
         if losses["val"] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses["val"]
             if iter_num > 0:
@@ -346,7 +368,6 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
                 model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
-    print(iter_num, max_iters)
     if iter_num == 0 and eval_only:
         break
 
@@ -400,9 +421,9 @@ while True:
     local_iter_num += 1
 
     # termination conditions
-    print(iter_num, max_iters)
     if iter_num > max_iters:
         break
-
+summary_writer.flush()
+summary_writer.close()
 if ddp:
     destroy_process_group()
