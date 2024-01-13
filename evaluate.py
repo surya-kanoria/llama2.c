@@ -57,7 +57,7 @@ def completion_with_backoff(**kwargs):
     return client.chat.completions.create(**kwargs)
 
 all_responses = []
-for i in range(3, num_files + 1):
+for i in range(19, 20):
     print('Generating evaluations for file:', i)
     file_name = os.path.join(data_dir, f"dataset_{str(i)}.json")
     with open(file_name, "r") as f:

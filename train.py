@@ -36,12 +36,11 @@ from preference import get_tokenizer_model_path
 
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = "out"
 eval_interval = 2000
 log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = False  # if True, always save a checkpoint after each eval
+always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = "resume"  # 'scratch' or 'resume'
 pretrained_checkpoint = 'out15M/stories15M.pt'
 # wandb logging
@@ -77,6 +76,10 @@ dtype = "float16"  # float32|bfloat16|float16
 compile = False  # use PyTorch 2.0 to compile the model to be faster
 # loss hparams
 beta = 0.1
+IPO_tau_parameter=0.1
+loss_type = "DPO"
+set_type="set_1"
+out_dir = f"out_{loss_type}_{str(beta).replace('.','_')}_{set_type}_{str(IPO_tau_parameter).replace('.','_')}"
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -143,6 +146,7 @@ iter_batches = partial(
     vocab_source=vocab_source,
     device=device,
     num_workers=0,
+    label_name=set_type
 )
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -168,7 +172,7 @@ if init_from == "scratch":
     model_ref.eval()
     model = Transformer(gptconf)
 elif init_from == "resume":
-    print(f"Resuming training from {out_dir}")
+    print(f"Resuming training from {pretrained_checkpoint}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
     checkpoint = torch.load(pretrained_checkpoint, map_location=device)
@@ -232,6 +236,13 @@ x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 x = x.repeat((batch_size, 1))
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
+def get_log_prob_of_stories(tokens, targets, model, story_length):
+    logits =  F.softmax(model(tokens), dim=-1)
+    log_prob_tokens = torch.gather(logits, -1, torch.unsqueeze(targets, 1))
+    log_prob_tokens = log_prob_tokens * story_length[:,1:]
+    log_prob_of_stories = torch.sum(log_prob_tokens, dim=-1)
+    return log_prob_of_stories
+
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -240,28 +251,35 @@ def estimate_loss():
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
-            story1, story2 = next(batch_iter)
+            story1, story2, story1_l, story2_l  = next(batch_iter)
             with ctx:
-                pie_theta_w = F.softmax(model(story1[:,:-1]), dim=-1)
-                pie_theta_l = F.softmax(model(story2[:,:-1]), dim=-1)
-                pie_ref_w = F.softmax(model_ref(story1), dim=-1)
-                pie_ref_l =F.softmax(model_ref(story2), dim=-1)
-                pie_theta_w = torch.gather(pie_theta_w, -1, torch.unsqueeze(story1[:,1:], 1))
-                pie_theta_l = torch.gather(pie_theta_l, -1, torch.unsqueeze(story2[:,1:], 1))
-                pie_ref_w = torch.gather(pie_ref_w, -1, torch.unsqueeze(story1[:,1:], 1))
-                pie_ref_l = torch.gather(pie_ref_l, -1, torch.unsqueeze(story2[:,1:], 1))
-                loss = get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l)
+                pie_theta_w = get_log_prob_of_stories(story1[:,:-1], story1[:,1:], model, story1_l)
+                pie_theta_l = get_log_prob_of_stories(story2[:,:-1], story2[:,1:], model, story2_l)
+                pie_ref_w = get_log_prob_of_stories(story1[:,:-1], story1[:,1:], model_ref, story1_l)
+                pie_ref_l = get_log_prob_of_stories(story2[:,:-1], story2[:,1:], model_ref, story2_l)
+                pi_logratios = pie_theta_w - pie_theta_l
+                ref_logratio = pie_ref_w - pie_ref_l
+                if loss_type == "DPO":
+                    loss = get_dpo_loss(pi_logratios, ref_logratio)
+                if loss_type == "IPO":
+                    loss = get_ipo_loss(pi_logratios, ref_logratio)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-def get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l):
-    pie_log_ratios = torch.log(pie_theta_w) - torch.log(pie_theta_l)
-    ref_log_ratios = torch.log(pie_ref_w) - torch.log(pie_ref_l)
-    losses = -F.logsigmoid(beta * (pie_log_ratios - ref_log_ratios))
-    print(losses)
-    return losses.mean()
+def get_dpo_loss(pi_logratios, ref_logratio):
+    return -F.logsigmoid(beta * (pi_logratios - ref_logratio)).mean()
+
+def get_ipo_loss(pi_logratios, ref_logratio):
+    return torch.square(pi_logratios - ref_logratio - 1/(2*IPO_tau_parameter))
+
+# def get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l):
+#     pie_log_ratios = torch.log(pie_theta_w) - torch.log(pie_theta_l)
+#     ref_log_ratios = torch.log(pie_ref_w) - torch.log(pie_ref_l)
+#     losses = -F.logsigmoid(beta * (pie_log_ratios - ref_log_ratios))
+#     print(losses)
+#     return losses.mean()
 
 
 # learning rate decay scheduler (cosine with warmup)
@@ -285,7 +303,7 @@ if wandb_log and master_process:
 
 # training loop
 train_batch_iter = iter_batches(split="train")
-story1, story2 = next(train_batch_iter)  # fetch the very first batch
+story1, story2, story1_l, story2_l  = next(train_batch_iter)  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -342,18 +360,17 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            pie_theta_w = F.softmax(model(story1[:,:-1]), dim=-1)
-            pie_theta_l = F.softmax(model(story2[:,:-1]), dim=-1)
-            pie_ref_w = F.softmax(model_ref(story1), dim=-1)
-            pie_ref_l =F.softmax(model_ref(story2), dim=-1)
-            pie_theta_w = torch.gather(pie_theta_w, -1, torch.unsqueeze(story1[:,1:], 1))
-            pie_theta_l = torch.gather(pie_theta_l, -1, torch.unsqueeze(story2[:,1:], 1))
-            pie_ref_w = torch.gather(pie_ref_w, -1, torch.unsqueeze(story1[:,1:], 1))
-            pie_ref_l = torch.gather(pie_ref_l, -1, torch.unsqueeze(story2[:,1:], 1))
-            loss = get_loss(pie_theta_w, pie_theta_l, pie_ref_w, pie_ref_l)
+            pie_theta_w = get_log_prob_of_stories(story1[:,:-1], story1[:,1:], model, story1_l)
+            pie_theta_l = get_log_prob_of_stories(story2[:,:-1], story2[:,1:], model, story2_l)
+            pie_ref_w = get_log_prob_of_stories(story1[:,:-1], story1[:,1:], model_ref, story1_l)
+            pie_ref_l = get_log_prob_of_stories(story2[:,:-1], story2[:,1:], model_ref, story2_l)
+            pi_logratios = pie_theta_w - pie_theta_l
+            ref_logratio = pie_ref_w - pie_ref_l
+            if loss_type == "DPO":
+                loss = get_dpo_loss(pi_logratios, ref_logratio)
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        story1, story2 = next(train_batch_iter)
+        story1, story2, story1_l, story2_l  = next(train_batch_iter)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

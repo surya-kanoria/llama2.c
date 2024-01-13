@@ -16,6 +16,7 @@ import requests
 import sentencepiece as spm
 import torch
 import torch.distributed as dist
+from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from tokenizer import Tokenizer
@@ -93,11 +94,23 @@ def train_vocab(vocab_size):
     print(f"Trained tokenizer is in {prefix}.model")
     print("Done.")
 
+def get_tokenizer_model_path(vocab_size):
+    """
+    Returns path to the sentencepiece tokenizer model for a given vocab size
+    vocab_size = 0 designates the default Llama 2 tokenizer, in that case
+    None is returned.
+    """
+    if vocab_size == 0:
+        return None
+    else:
+        return os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}.model")
+    
+tokenizer_model = get_tokenizer_model_path(0)
+enc = Tokenizer(tokenizer_model)
 
 def process_shard(args, vocab_size):
     shard_id, shard = args
-    tokenizer_model = get_tokenizer_model_path(vocab_size)
-    enc = Tokenizer(tokenizer_model)
+    
     with open(shard, "r") as f:
         data = json.load(f)
     all_tokens = []
@@ -108,10 +121,9 @@ def process_shard(args, vocab_size):
         text2 = example["story2"]
         text2 = text2.strip()
         tokens2 = enc.encode(text2, bos=True, eos=False)
-        if example["label"] == 1:
-            all_tokens.append({"story1": tokens1, "story2": tokens2})
-        else:
-            all_tokens.append({"story1": tokens2, "story2": tokens1})
+        all_tokens.append({"story1": tokens1, "story2": tokens2})
+        for r in range(1,19):
+            all_tokens[-1][f"set_{str(r)}"] = example[f"set_{str(r)}"]
     # convert to uint16 nparray
     # calculate the output filename
     if vocab_size == 0:
@@ -136,7 +148,7 @@ def process_shard(args, vocab_size):
 
 def pretokenize(vocab_size):
     # iterate the shards and tokenize all of them one by one
-    data_dir = os.path.join(DATA_CACHE_DIR, "PreferenceDataset")
+    data_dir = os.path.join(DATA_CACHE_DIR, "TrainDataset")
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "dataset_*.json")))
     print(shard_filenames)
     if vocab_size > 0:
@@ -156,12 +168,13 @@ def pretokenize(vocab_size):
 class PretokDataset(torch.utils.data.IterableDataset):
     """Loads pretokenized examples from disk and yields them as PyTorch tensors."""
 
-    def __init__(self, split, max_seq_len, vocab_size, vocab_source):
+    def __init__(self, split, max_seq_len, vocab_size, vocab_source, label_name):
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.vocab_source = vocab_source
+        self._label_name = label_name
 
     def __iter__(self):
         # get worker info within a DataLoader
@@ -175,12 +188,12 @@ class PretokDataset(torch.utils.data.IterableDataset):
         print(f"Created a PretokDataset with rng seed {seed}")
         if self.vocab_source == "llama2":
             # the .bin files are right along the .json files
-            bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "tokenized_preferencedata_test*.json")))
+            bin_dir = os.path.join(DATA_CACHE_DIR, "TrainDataset")
+            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "tokenized_dataset*.json")))
         elif self.vocab_source == "custom":
             # the .bin files are in tok{N} directory
             bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "tokenized_preferencedata_test*.json")))
+            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "tokenized_dataset*.json")))
         # train/test split. let's use only shard 0 for test split, rest train
         shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
         assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
@@ -191,23 +204,30 @@ class PretokDataset(torch.utils.data.IterableDataset):
                 # open the dataset for reading but keep it on disk with memmap
                     stories = json.load(f)
                     for story in stories:
-                        story1 = torch.from_numpy(np.asanyarray(story["story1"]).astype(np.int64))
-                        story2 = torch.from_numpy(np.asarray(story["story2"]).astype(np.int64))
-                        yield story1, story2
+                        story1 = story["story1"]
+                        story2 = story["story2"]
+                        story_length1 = np.ones_like(story1)
+                        story_length2 = np.ones_like(story2)
+                        if story[self._label_name] == 1:
+                            yield story1, story2, story_length1, story_length2
+                        else:
+                            yield story2, story1, story_length2, story_length1
+
+def collate_fn(s):
+    story1, story2 = [ss[0][:256] for ss in s], [ss[1][:256] for ss in s]
+    story_length1, story_length2 = [ss[2][:256] for ss in s], [ss[3][:256] for ss in s] 
+    story1 = [torch.from_numpy(np.asanyarray(story).astype(np.int64)) for story in story1]
+    story2 = [torch.from_numpy(np.asanyarray(story).astype(np.int64)) for story in story2]
+    story_length1 = [torch.from_numpy(np.asanyarray(story).astype(np.int64)) for story in story_length1]
+    story_length2 = [torch.from_numpy(np.asanyarray(story).astype(np.int64)) for story in story_length2]
+    story1 = pad_sequence(story1, batch_first=True)
+    story2 = pad_sequence(story2, batch_first=True)
+    story_length1 = pad_sequence(story_length1, batch_first=True)
+    story_length2 = pad_sequence(story_length2, batch_first=True)
+    return story1, story2, story_length1, story_length2
 
 # -----------------------------------------------------------------------------
 # public interface functions
-
-def get_tokenizer_model_path(vocab_size):
-    """
-    Returns path to the sentencepiece tokenizer model for a given vocab size
-    vocab_size = 0 designates the default Llama 2 tokenizer, in that case
-    None is returned.
-    """
-    if vocab_size == 0:
-        return None
-    else:
-        return os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}.model")
 
 class Task:
 
@@ -215,12 +235,12 @@ class Task:
     def iter_batches(batch_size, device, num_workers=0, **dataset_kwargs):
         ds = PretokDataset(**dataset_kwargs)
         dl = torch.utils.data.DataLoader(
-            ds, batch_size=batch_size, pin_memory=True, num_workers=num_workers
+            ds, batch_size=batch_size, pin_memory=True, num_workers=num_workers, collate_fn=collate_fn
         )
-        for x, y in dl:
+        for x, y, x_l, y_l in dl:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            yield x, y
+            yield x, y, x_l, y_l
 
 # -----------------------------------------------------------------------------
 # CLI for constructing the dataset
